@@ -245,7 +245,7 @@ details summary{cursor:pointer;font-weight:600;list-style-position:outside}
 
 <script>
 'use strict';
-const APP_VERSION='2026.10.14-12';
+const APP_VERSION='2026.10.15-13';
 /* ===================== 基本工具 ===================== */
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -617,6 +617,30 @@ function ingest(t,rawLine,res){
     if(fm.review){nt.status='pending';if(fm.review.status!=='confirmed')fm.review.status='pending';S.reviews.push({id:uid(),a:fm.review.id,b:nt.id,kind:fm.kind,resolved:false});res.review++}
   }
 }
+// 銀行電郵：信用卡交易通知、直接付款授權（eDDA）轉賬
+const WALLET_RE=/(payme|八達通|octopus|alipay|支付寶|wechat|微信|tap ?& ?go|拍住賞|boc ?pay|增值|top.?up|錢包|wallet)/i;
+function parseBankMail(text){
+  const t=String(text);
+  const isCard=/(信用卡交易通知|credit card transaction|card transaction|簽賬通知|信用卡.{0,12}(簽賬|交易|消費))/i.test(t);
+  const isDD=/(直接付款授權|direct debit|edda|直接扣賬)/i.test(t);
+  if(!isCard&&!isDD)return null;
+  if(/(設立|建立|成功登記|登記成功|set ?up|registration|取消|cancel|修改)/i.test(t)&&!/(已轉賬|已轉帳|已扣|debited|charged|交易金額|付款金額|轉賬金額|轉帳金額|transaction amount)/i.test(t))return{skip:true};
+  const parts=t.split(/\s*¦\s*/).filter(x=>!/(可用|信用額|額度|credit limit|available|結餘|balance|上限|最低還款|minimum payment|到期)/i.test(x));
+  const body=parts.join(' ¦ ');
+  const am=body.match(AMT_RE);if(!am)return{skip:true};
+  const amount=num(am[1]||am[2]);if(!(amount>0))return{skip:true};
+  const MP=[/(?:商戶|商號|商店|merchant)\s*(?:名稱|name)?\s*[:：]\s*([^¦,，。;]+)/i,/(?:收款人|收款方|收款戶口名稱|payee|beneficiary|receiver)\s*(?:名稱|name)?\s*[:：]?\s*([^¦,，。;]+)/i,/(?:在|於)\s*([^¦，,。\d\s][^¦，,。]*?)\s*(?:簽賬|消費|進行|交易)/,/\bat\s+([A-Z0-9*][^¦,;]*?)(?:\s+on\s|\s+for\s|\s*[¦,;]|\.\s|$)/i,/(?:轉賬至|轉帳至|轉賬予|轉帳予|付款予|付款至|轉賬給|轉帳給|to)\s+([^¦,，。;]+?)(?:\s+on\s|[¦,，。;]|$)/i];
+  let merchant='';for(const p of MP){const m=body.match(p);if(m&&m[1].trim()&&!/^(HKD|HK\$|\$|港元)/i.test(m[1].trim())){merchant=m[1].trim();break}}
+  merchant=merchant.replace(/(?:HKD|HK\$|\$|港元|港幣)\s*[\d,.]+/ig,'').replace(/\s+on\s+\d.*$/i,'').trim().slice(0,48);
+  const l4=body.match(/(?:尾號|末四位|ending(?: in| with)?|card(?: number| no\.?)?(?: ending)?)[^\d]{0,14}(\d{4})/i)||body.match(/[*xX•]{2,}[\s-]?(\d{4})/);
+  let type=/(退款|refund|reversal|credit adjustment|退回)/i.test(body)?'refund':'expense';
+  let channel;
+  if(isDD&&!isCard){channel='autopay';if(WALLET_RE.test(merchant||body))type='transfer';if(!merchant)merchant='直接付款授權'}
+  else{let c=l4?matchCard(l4[1]):matchCard(body);if(!c&&l4)c=ensureCard('尾號 '+l4[1],'credit'),c.keywords=[l4[1]];channel=c?c.id:'credit';
+    if(c&&c.collect===false)return{skip:true};
+    if(/payme|增值|top.?up|充值/i.test(merchant))type='transfer';if(!merchant)merchant='信用卡簽賬'}
+  return{amount,merchant,channel,type};
+}
 function producedBy(line){const hit=x=>x&&(x===line||line.includes(x));return S.txns.concat(S.trash.filter(e=>e.kind==='txn').map(e=>e.item)).some(t=>(t.raw||[]).some(hit))||S.incomeEntries.some(e=>(e.raw||[]).some(hit))}
 function importText(text,opts={}){
   const res={added:0,merged:0,review:0,skipped:0,dupe:0,income:0,src:{pay:0,sms:0,mail:0}};
@@ -630,7 +654,10 @@ function importText(text,opts={}){
     if(r.kind==='ocr'||r.kind==='mail'){
       const src=r.kind==='mail'?'mail':'notif';
       if(!S.channels[src]){res.skipped++;continue}
-      const ts=parseTime(r.parts[1])||fmtLocal(new Date());const items=parseNotifs(r.parts.slice(2).join(' ¦ '),src==='mail');
+      const ts=parseTime(r.parts[1])||fmtLocal(new Date());
+      if(src==='mail'){const bk=parseBankMail(r.parts.slice(2).join(' ¦ '));
+        if(bk){if(bk.skip){res.skipped++;continue}S.imported[h]=1;ingest({ts,amount:bk.amount,merchant:bk.merchant,channel:bk.channel,type:bk.type,source:'mail'},r.line,res);continue}}
+      const items=parseNotifs(r.parts.slice(2).join(' ¦ '),src==='mail');
       if(!items.length){res.skipped++;continue}
       for(const it of items){
         const k='n'+hash(it.key);if(S.imported[k]){res.dupe++;continue}S.imported[k]=1;
@@ -1046,7 +1073,7 @@ function resolveReview(id,same){
 const TYPE_CARD={credit:'信用卡',debit:'扣賬卡',octopus:'八達通',ewallet:'電子錢包'};
 function renderCards(){
   const m=curMonth();
-  const ch=[['applepay','Apple Pay（Wallet 交易）','每次拍卡由捷徑記低卡名、商戶、金額'],['sms','銀行短訊','捷徑轉交短訊，app 喺本機解析'],['octopus','八達通','Wallet 入面嘅八達通交易'],['mail','電郵通知（PayMe／BoC Pay／轉數快）','Gmail 每 5 分鐘自動檢查，撳右上角「更新」即時檢查；只讀'],['cash','現金快速記帳','總覽頁嘅一句話記帳']];
+  const ch=[['applepay','Apple Pay（Wallet 交易）','每次拍卡由捷徑記低卡名、商戶、金額'],['sms','銀行短訊','捷徑轉交短訊，app 喺本機解析'],['octopus','八達通','Wallet 入面嘅八達通交易'],['mail','電郵通知（PayMe／BoC Pay／轉數快／銀行交易通知）','Gmail 每 5 分鐘自動檢查，撳右上角「更新」即時檢查；只讀'],['cash','現金快速記帳','總覽頁嘅一句話記帳']];
   $('#tab-cards').innerHTML=`
   <div class="page-head"><div><div class="eyebrow">收邊啲、點計回贈，由你揀。</div><h1>卡與渠道</h1></div></div>
   <div class="card" id="gs-card"><div class="card-head"><h3>Google 試算表</h3>${CONN?`<span class="badge">${net.state==='err'?'連線失敗':'已連接'}</span>`:''}</div>
